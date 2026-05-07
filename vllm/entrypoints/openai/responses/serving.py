@@ -59,6 +59,7 @@ from vllm.entrypoints.openai.engine.serving import (
     GenerationError,
     OpenAIServing,
 )
+from vllm.entrypoints.openai.llm_sign import maybe_sign_responses_response
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.openai.parser.harmony_utils import (
     get_developer_message,
@@ -900,13 +901,36 @@ class OpenAIServingResponses(OpenAIServing):
             kv_transfer_params=context.kv_transfer_params,
         )
 
+        # Upstream behaviour: persist the response in the session
+        # store when the client opted in. Kept byte-for-byte identical
+        # to upstream so disabling llm_sign produces the original code
+        # path.
         if request.store:
             async with self.response_store_lock:
                 stored_response = self.response_store.get(response.id)
                 # If the response is already cancelled, don't update it.
                 if stored_response is None or stored_response.status != "cancelled":
                     self.response_store[response.id] = response
-        return response
+
+        # llm_sign parent-hash binding (only runs when enabled).
+        # Looks up the parent turn's artifact hash from the session
+        # store so the signer can bind this turn's signature to that
+        # specific parent; see ``spec/normalization.md`` §12 and
+        # ``HANDOFF.md`` §8.5.
+        parent_hash: str | None = None
+        if envs.VLLM_LLM_SIGN_ENABLED and request.previous_response_id is not None:
+            async with self.response_store_lock:
+                parent = self.response_store.get(request.previous_response_id)
+            if parent is not None:
+                parent_llm_sign = getattr(parent, "llm_sign", None)
+                if isinstance(parent_llm_sign, dict):
+                    candidate = parent_llm_sign.get("artifact_hash")
+                    if isinstance(candidate, str):
+                        parent_hash = candidate
+
+        return maybe_sign_responses_response(
+            request, response, parent_hash=parent_hash,
+        )
 
     def _topk_logprobs(
         self,

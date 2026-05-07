@@ -8,6 +8,7 @@ from typing import Any
 
 import vllm.envs as envs
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionResponse
+from vllm.entrypoints.openai.responses.protocol import ResponsesResponse
 
 
 def maybe_sign_chat_completion(
@@ -58,11 +59,69 @@ def maybe_sign_chat_completion(
         response.model_dump(mode="json", exclude_none=False)
     )
     envelope: dict[str, Any] = {}
-    signer.sign_and_attach(envelope, request_payload, response_payload)
+    signer.sign_chat_and_attach(envelope, request_payload, response_payload)
     # ``ChatCompletionResponse`` (via ``OpenAIBaseModel``) sets
     # ``model_config = ConfigDict(extra="allow")``, so the ``llm_sign`` field
     # is a valid dynamic attribute at runtime. mypy cannot see that through
     # pydantic's config, hence the targeted ignore.
+    response.llm_sign = envelope["llm_sign"]  # type: ignore[attr-defined]
+    return response
+
+
+def maybe_sign_responses_response(
+    request: Any,
+    response: Any,
+    parent_hash: str | None = None,
+) -> Any:
+    """Attach llm_sign metadata to a ``/v1/responses`` response when enabled.
+
+    Mirror of :func:`maybe_sign_chat_completion` for the OpenAI
+    Responses API. Projects the request and response to the Responses
+    v1 canonical schemas (vLLM-only knobs such as ``kv_transfer_params``,
+    ``vllm_xargs``, ``prompt_cache_key``, ``cache_salt`` are dropped;
+    they are not part of the signing whitelist), signs the turn with
+    the shared TLS credential, and attaches the artifact envelope.
+
+    The Responses API is stateful (``previous_response_id`` points at
+    a prior turn held in the server's store), and the
+    ``previous_response_id`` pointer is part of the signed input
+    payload. When ``parent_hash`` is supplied, it is also injected
+    into the signed input payload under ``previous_response_hash`` —
+    this is the server's own record of the parent turn's artifact
+    hash (looked up from the session store, not read from client
+    input), which binds the current turn's signature to that specific
+    prior artifact rather than to whatever content is sitting under
+    the id string at verification time.
+
+    Forking — the same ``previous_response_id`` used on multiple
+    create calls — produces independent artifacts with distinct
+    ``chain_id`` values. llm_sign does not attempt to detect or
+    prevent forks; see ``spec/normalization.md`` §12.
+    """
+
+    if not envs.VLLM_LLM_SIGN_ENABLED or not isinstance(response, ResponsesResponse):
+        return response
+
+    signer = _get_signer()
+    from llm_sign import (
+        project_openai_responses_request,
+        project_openai_responses_response,
+    )
+
+    request_payload = project_openai_responses_request(
+        request.model_dump(mode="json", exclude_none=False)
+    )
+    response_payload = project_openai_responses_response(
+        response.model_dump(mode="json", exclude_none=False)
+    )
+    envelope: dict[str, Any] = {}
+    signer.sign_responses_and_attach(
+        envelope, request_payload, response_payload, parent_hash=parent_hash,
+    )
+    # ``ResponsesResponse`` (via ``OpenAIBaseModel``) sets
+    # ``model_config = ConfigDict(extra="allow")``, so the ``llm_sign``
+    # field is a valid dynamic attribute at runtime. mypy cannot see
+    # that through pydantic's config, hence the targeted ignore.
     response.llm_sign = envelope["llm_sign"]  # type: ignore[attr-defined]
     return response
 
@@ -82,6 +141,7 @@ class _OpenAILLMSigner:
                 TLSCertificateCredential,
                 attach_signed_artifact_to_openai_response,
                 sign_openai_chat_turn,
+                sign_openai_responses_turn,
             )
         except ImportError as exc:
             raise ImportError(
@@ -94,9 +154,10 @@ class _OpenAILLMSigner:
         )
         self._signer = self._credential.signer()
         self._sign_openai_chat_turn = sign_openai_chat_turn
+        self._sign_openai_responses_turn = sign_openai_responses_turn
         self._attach = attach_signed_artifact_to_openai_response
 
-    def sign_and_attach(
+    def sign_chat_and_attach(
         self,
         envelope: dict[str, Any],
         request: Mapping[str, Any],
@@ -106,6 +167,22 @@ class _OpenAILLMSigner:
             request=request,
             response=response,
             signer=self._signer,
+        )
+        self._attach(envelope, artifact=artifact, credential=self._credential)
+
+    def sign_responses_and_attach(
+        self,
+        envelope: dict[str, Any],
+        request: Mapping[str, Any],
+        response: Mapping[str, Any],
+        *,
+        parent_hash: str | None = None,
+    ) -> None:
+        artifact = self._sign_openai_responses_turn(
+            request=request,
+            response=response,
+            signer=self._signer,
+            parent_hash=parent_hash,
         )
         self._attach(envelope, artifact=artifact, credential=self._credential)
 
