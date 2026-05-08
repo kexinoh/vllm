@@ -77,12 +77,13 @@ def maybe_sign_responses_response(
     request: Any,
     response: Any,
     parent_hash: str | None = None,
+    start_seq: int = 0,
 ) -> Any:
     """Attach llm_sign metadata to a ``/v1/responses`` response when enabled.
 
     Mirror of :func:`maybe_sign_chat_completion` for the OpenAI
     Responses API. Projects the request and response to the Responses
-    v1 canonical schemas (vLLM-only knobs such as ``kv_transfer_params``,
+    canonical schemas (vLLM-only knobs such as ``kv_transfer_params``,
     ``vllm_xargs``, ``prompt_cache_key``, ``cache_salt`` are dropped;
     they are not part of the signing whitelist), signs the turn with
     the shared TLS credential, and attaches the artifact envelope.
@@ -98,10 +99,18 @@ def maybe_sign_responses_response(
     prior artifact rather than to whatever content is sitting under
     the id string at verification time.
 
+    ``start_seq`` lets a multi-turn Responses session continue ``seq``
+    monotonically across turns: turn 1 signs blocks at seq=0,1; turn 2
+    at seq=2,3; etc. The chain-level structure is still independent
+    per turn (``prev_block_digest`` on each turn's first block is
+    ``null``); the seq numbering is the only artifact-level signal
+    of a session's turn ordering. Cross-turn integrity is by
+    ``previous_response_hash`` in the signed input.
+
     Forking — the same ``previous_response_id`` used on multiple
-    create calls — produces independent artifacts with distinct
-    ``chain_id`` values. llm_sign does not attempt to detect or
-    prevent forks; see ``spec/normalization.md`` §12.
+    create calls — produces independent artifacts. Each fork starts
+    its first block at the same ``start_seq``; that's intentional and
+    fine, llm_sign does not attempt to detect or prevent forks.
     """
 
     if not envs.VLLM_LLM_SIGN_ENABLED or not isinstance(response, ResponsesResponse):
@@ -126,7 +135,8 @@ def maybe_sign_responses_response(
     )
     envelope: dict[str, Any] = {}
     signer.sign_responses_and_attach(
-        envelope, request_payload, response_payload, parent_hash=parent_hash,
+        envelope, request_payload, response_payload,
+        parent_hash=parent_hash, start_seq=start_seq,
     )
     # ``ResponsesResponse`` (via ``OpenAIBaseModel``) sets
     # ``model_config = ConfigDict(extra="allow")``, so the ``llm_sign``
@@ -187,12 +197,14 @@ class _OpenAILLMSigner:
         response: Mapping[str, Any],
         *,
         parent_hash: str | None = None,
+        start_seq: int = 0,
     ) -> None:
         artifact = self._sign_openai_responses_turn(
             request=request,
             response=response,
             signer=self._signer,
             parent_hash=parent_hash,
+            start_seq=start_seq,
         )
         self._attach(envelope, artifact=artifact, credential=self._credential)
 

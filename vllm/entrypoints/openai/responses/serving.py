@@ -912,12 +912,15 @@ class OpenAIServingResponses(OpenAIServing):
                 if stored_response is None or stored_response.status != "cancelled":
                     self.response_store[response.id] = response
 
-        # llm_sign parent-hash binding (only runs when enabled).
-        # Looks up the parent turn's artifact hash from the session
-        # store so the signer can bind this turn's signature to that
-        # specific parent; see ``spec/normalization.md`` §12 and
+        # llm_sign parent-hash binding + cross-turn seq continuity
+        # (only runs when enabled). Looks up the parent turn's
+        # artifact hash AND its terminal seq from the session store,
+        # so the signer can bind this turn's signature to that
+        # specific parent and continue numbering monotonically across
+        # the conversation. See ``spec/normalization.md`` §12 and
         # ``HANDOFF.md`` §8.5.
         parent_hash: str | None = None
+        start_seq: int = 0
         if envs.VLLM_LLM_SIGN_ENABLED and request.previous_response_id is not None:
             async with self.response_store_lock:
                 parent = self.response_store.get(request.previous_response_id)
@@ -927,9 +930,20 @@ class OpenAIServingResponses(OpenAIServing):
                     candidate = parent_llm_sign.get("artifact_hash")
                     if isinstance(candidate, str):
                         parent_hash = candidate
+                    parent_artifact = parent_llm_sign.get("artifact")
+                    if isinstance(parent_artifact, dict):
+                        parent_chain = parent_artifact.get("chain")
+                        if isinstance(parent_chain, list) and parent_chain:
+                            last_signed = parent_chain[-1]
+                            if isinstance(last_signed, dict):
+                                last_block = last_signed.get("block")
+                                if isinstance(last_block, dict):
+                                    last_seq = last_block.get("seq")
+                                    if isinstance(last_seq, int):
+                                        start_seq = last_seq + 1
 
         return maybe_sign_responses_response(
-            request, response, parent_hash=parent_hash,
+            request, response, parent_hash=parent_hash, start_seq=start_seq,
         )
 
     def _topk_logprobs(
