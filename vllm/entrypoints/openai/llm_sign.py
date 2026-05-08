@@ -46,14 +46,19 @@ def maybe_sign_chat_completion(
         return response
 
     signer = _get_signer()
-    # Use exclude_none=False so the signed payload mirrors the JSON body
-    # FastAPI returns to the client (its default encoder keeps null fields).
-    # Otherwise a verifier that re-canonicalizes the HTTP body would compute
-    # a different digest and reject a legitimate signature.
+    # The request payload uses ``exclude_unset=True``: only the fields the
+    # client *explicitly set* on the wire enter the signed digest. Pydantic
+    # otherwise materializes every schema default (``frequency_penalty=0.0``,
+    # ``n=1``, ``logprobs=False``, ...), and a verifier that re-canonicalizes
+    # the bytes the client actually sent would compute a different digest and
+    # reject a legitimate signature. The response payload uses
+    # ``exclude_none=False`` because that mirrors what FastAPI's default JSON
+    # encoder produces on the wire (null fields kept), and the client reads
+    # exactly those bytes.
     from llm_sign import project_openai_chat_request, project_openai_chat_response
 
     request_payload = project_openai_chat_request(
-        request.model_dump(mode="json", exclude_none=False)
+        request.model_dump(mode="json", exclude_unset=True)
     )
     response_payload = project_openai_chat_response(
         response.model_dump(mode="json", exclude_none=False)
@@ -108,8 +113,13 @@ def maybe_sign_responses_response(
         project_openai_responses_response,
     )
 
+    # See ``maybe_sign_chat_completion`` for the rationale: the request
+    # uses ``exclude_unset=True`` to capture only what the client actually
+    # sent on the wire; the response uses ``exclude_none=False`` because
+    # FastAPI's encoder emits null fields and the client reads exactly
+    # those bytes.
     request_payload = project_openai_responses_request(
-        request.model_dump(mode="json", exclude_none=False)
+        request.model_dump(mode="json", exclude_unset=True)
     )
     response_payload = project_openai_responses_response(
         response.model_dump(mode="json", exclude_none=False)
