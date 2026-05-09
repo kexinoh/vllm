@@ -59,7 +59,10 @@ from vllm.entrypoints.openai.engine.serving import (
     GenerationError,
     OpenAIServing,
 )
-from vllm.entrypoints.openai.llm_sign import maybe_sign_responses_response
+from vllm.entrypoints.openai.llm_sign import (
+    maybe_sign_responses_response,
+    responses_parent_signing_context,
+)
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.openai.parser.harmony_utils import (
     get_developer_message,
@@ -374,6 +377,11 @@ class OpenAIServingResponses(OpenAIServing):
         else:
             prev_response = None
 
+        parent_hash: str | None = None
+        start_seq = 0
+        if envs.VLLM_LLM_SIGN_ENABLED and prev_response is not None:
+            parent_hash, start_seq = responses_parent_signing_context(prev_response)
+
         lora_request = self._maybe_get_adapters(request)
         model_name = self.models.model_name(lora_request)
 
@@ -541,6 +549,8 @@ class OpenAIServingResponses(OpenAIServing):
                         tokenizer,
                         request_metadata,
                         created_time,
+                        parent_hash=parent_hash,
+                        start_seq=start_seq,
                     ),
                     name=f"create_{request.request_id}",
                 )
@@ -555,6 +565,8 @@ class OpenAIServingResponses(OpenAIServing):
                         tokenizer,
                         request_metadata,
                         created_time,
+                        parent_hash=parent_hash,
+                        start_seq=start_seq,
                     ),
                     name=f"create_{response.id}",
                 )
@@ -579,6 +591,8 @@ class OpenAIServingResponses(OpenAIServing):
                 model_name,
                 tokenizer,
                 request_metadata,
+                parent_hash=parent_hash,
+                start_seq=start_seq,
             )
 
         return await self.responses_full_generator(
@@ -589,6 +603,8 @@ class OpenAIServingResponses(OpenAIServing):
             model_name,
             tokenizer,
             request_metadata,
+            parent_hash=parent_hash,
+            start_seq=start_seq,
         )
 
     async def _make_request(
@@ -768,6 +784,9 @@ class OpenAIServingResponses(OpenAIServing):
         tokenizer: TokenizerLike,
         request_metadata: RequestResponseMetadata,
         created_time: int | None = None,
+        *,
+        parent_hash: str | None = None,
+        start_seq: int = 0,
     ) -> ErrorResponse | ResponsesResponse:
         if created_time is None:
             created_time = int(time.time())
@@ -912,38 +931,11 @@ class OpenAIServingResponses(OpenAIServing):
                 if stored_response is None or stored_response.status != "cancelled":
                     self.response_store[response.id] = response
 
-        # llm_sign parent-hash binding + cross-turn seq continuity
-        # (only runs when enabled). Looks up the parent turn's
-        # artifact hash AND its terminal seq from the session store,
-        # so the signer can bind this turn's signature to that
-        # specific parent and continue numbering monotonically across
-        # the conversation. See ``spec/normalization.md`` §12 and
-        # ``HANDOFF.md`` §8.5.
-        parent_hash: str | None = None
-        start_seq: int = 0
-        if envs.VLLM_LLM_SIGN_ENABLED and request.previous_response_id is not None:
-            async with self.response_store_lock:
-                parent = self.response_store.get(request.previous_response_id)
-            if parent is not None:
-                parent_llm_sign = getattr(parent, "llm_sign", None)
-                if isinstance(parent_llm_sign, dict):
-                    candidate = parent_llm_sign.get("artifact_hash")
-                    if isinstance(candidate, str):
-                        parent_hash = candidate
-                    parent_artifact = parent_llm_sign.get("artifact")
-                    if isinstance(parent_artifact, dict):
-                        parent_chain = parent_artifact.get("chain")
-                        if isinstance(parent_chain, list) and parent_chain:
-                            last_signed = parent_chain[-1]
-                            if isinstance(last_signed, dict):
-                                last_block = last_signed.get("block")
-                                if isinstance(last_block, dict):
-                                    last_seq = last_block.get("seq")
-                                    if isinstance(last_seq, int):
-                                        start_seq = last_seq + 1
-
         return maybe_sign_responses_response(
-            request, response, parent_hash=parent_hash, start_seq=start_seq,
+            request,
+            response,
+            parent_hash=parent_hash,
+            start_seq=start_seq,
         )
 
     def _topk_logprobs(
@@ -2013,6 +2005,9 @@ class OpenAIServingResponses(OpenAIServing):
         tokenizer: TokenizerLike,
         request_metadata: RequestResponseMetadata,
         created_time: int | None = None,
+        *,
+        parent_hash: str | None = None,
+        start_seq: int = 0,
     ) -> AsyncGenerator[StreamingResponsesResponse, None]:
         # TODO:
         # 1. Handle disconnect
@@ -2100,6 +2095,8 @@ class OpenAIServingResponses(OpenAIServing):
                 tokenizer,
                 request_metadata,
                 created_time=created_time,
+                parent_hash=parent_hash,
+                start_seq=start_seq,
             )
             yield _increment_sequence_number_and_return(
                 ResponseCompletedEvent(

@@ -11,6 +11,41 @@ from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRespo
 from vllm.entrypoints.openai.responses.protocol import ResponsesResponse
 
 
+def responses_parent_signing_context(parent_response: Any) -> tuple[str | None, int]:
+    parent_hash: str | None = None
+    start_seq = 0
+
+    parent_llm_sign = getattr(parent_response, "llm_sign", None)
+    if not isinstance(parent_llm_sign, Mapping):
+        return parent_hash, start_seq
+
+    candidate = parent_llm_sign.get("artifact_hash")
+    if isinstance(candidate, str):
+        parent_hash = candidate
+
+    parent_artifact = parent_llm_sign.get("artifact")
+    if not isinstance(parent_artifact, Mapping):
+        return parent_hash, start_seq
+
+    parent_chain = parent_artifact.get("chain")
+    if not isinstance(parent_chain, list) or not parent_chain:
+        return parent_hash, start_seq
+
+    last_signed = parent_chain[-1]
+    if not isinstance(last_signed, Mapping):
+        return parent_hash, start_seq
+
+    last_block = last_signed.get("block")
+    if not isinstance(last_block, Mapping):
+        return parent_hash, start_seq
+
+    last_seq = last_block.get("seq")
+    if isinstance(last_seq, int):
+        start_seq = last_seq + 1
+
+    return parent_hash, start_seq
+
+
 def maybe_sign_chat_completion(
     request: Any,
     response: Any,
@@ -127,16 +162,21 @@ def maybe_sign_responses_response(
     # sent on the wire; the response uses ``exclude_none=False`` because
     # FastAPI's encoder emits null fields and the client reads exactly
     # those bytes.
-    request_payload = project_openai_responses_request(
-        request.model_dump(mode="json", exclude_unset=True)
-    )
+    raw_request_payload = request.model_dump(mode="json", exclude_unset=True)
+    # ``previous_response_hash`` is a server-injected binding derived from
+    # ``response_store``. Never let a client-supplied extra field choose it.
+    raw_request_payload.pop("previous_response_hash", None)
+    request_payload = project_openai_responses_request(raw_request_payload)
     response_payload = project_openai_responses_response(
         response.model_dump(mode="json", exclude_none=False)
     )
     envelope: dict[str, Any] = {}
     signer.sign_responses_and_attach(
-        envelope, request_payload, response_payload,
-        parent_hash=parent_hash, start_seq=start_seq,
+        envelope,
+        request_payload,
+        response_payload,
+        parent_hash=parent_hash,
+        start_seq=start_seq,
     )
     # ``ResponsesResponse`` (via ``OpenAIBaseModel``) sets
     # ``model_config = ConfigDict(extra="allow")``, so the ``llm_sign``

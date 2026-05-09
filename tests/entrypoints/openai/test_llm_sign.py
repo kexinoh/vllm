@@ -6,6 +6,7 @@ from __future__ import annotations
 import builtins
 import sys
 from types import ModuleType
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -18,6 +19,11 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatMessage,
 )
 from vllm.entrypoints.openai.engine.protocol import UsageInfo
+from vllm.entrypoints.openai.responses.protocol import (
+    ResponsesRequest,
+    ResponsesResponse,
+)
+from vllm.entrypoints.openai.responses.serving import OpenAIServingResponses
 
 
 @pytest.fixture(autouse=True)
@@ -42,6 +48,15 @@ def test_llm_sign_is_disabled_by_default():
     # vLLM response: the ``llm_sign`` key must not appear at all (as opposed
     # to appearing with a null value), so unsigned deployments stay
     # byte-compatible with upstream vLLM.
+    assert "llm_sign" not in response.model_dump_json()
+
+
+def test_llm_sign_responses_is_disabled_by_default():
+    request = _responses_request()
+    response = _responses_response()
+
+    assert llm_sign.maybe_sign_responses_response(request, response) is response
+    assert "llm_sign" not in response.model_dump()
     assert "llm_sign" not in response.model_dump_json()
 
 
@@ -103,6 +118,189 @@ def test_llm_sign_filters_vllm_only_response_fields(monkeypatch: pytest.MonkeyPa
     assert "llm_sign" not in signed_response
 
 
+def test_llm_sign_filters_vllm_only_responses_request_fields(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("VLLM_LLM_SIGN_ENABLED", "1")
+    monkeypatch.setenv("VLLM_LLM_SIGN_CERTFILE", "cert.pem")
+    monkeypatch.setenv("VLLM_LLM_SIGN_KEYFILE", "key.pem")
+
+    captured: list[dict] = []
+    _install_fake_llm_sign(monkeypatch, captured)
+
+    request = ResponsesRequest(
+        model="test-model",
+        input="ping",
+        temperature=0.0,
+        kv_transfer_params={"foo": "bar"},
+        prompt_cache_key="cache-key",
+        cache_salt="salt",
+        vllm_xargs={"internal": "value"},
+    )
+    llm_sign.maybe_sign_responses_response(request, _responses_response())
+
+    signed_request = captured[1]["request"]
+    assert signed_request["model"] == "test-model"
+    assert signed_request["input"] == "ping"
+    assert signed_request["temperature"] == 0.0
+    assert "kv_transfer_params" not in signed_request
+    assert "prompt_cache_key" not in signed_request
+    assert "cache_salt" not in signed_request
+    assert "vllm_xargs" not in signed_request
+    assert "request_id" not in signed_request
+
+
+def test_llm_sign_strips_client_supplied_previous_response_hash(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("VLLM_LLM_SIGN_ENABLED", "1")
+    monkeypatch.setenv("VLLM_LLM_SIGN_CERTFILE", "cert.pem")
+    monkeypatch.setenv("VLLM_LLM_SIGN_KEYFILE", "key.pem")
+
+    captured: list[dict] = []
+    _install_fake_llm_sign(monkeypatch, captured)
+
+    request = ResponsesRequest(
+        model="test-model",
+        input="ping",
+        previous_response_id="resp-parent",
+        previous_response_hash="client-forged-hash",
+    )
+    llm_sign.maybe_sign_responses_response(
+        request,
+        _responses_response(previous_response_id="resp-parent"),
+        parent_hash="server-observed-parent-hash",
+    )
+
+    signed_request = captured[1]["request"]
+    assert signed_request["previous_response_id"] == "resp-parent"
+    assert "previous_response_hash" not in signed_request
+    assert captured[1]["parent_hash"] == "server-observed-parent-hash"
+
+
+def test_llm_sign_reads_parent_hash_from_saved_response_only():
+    parent = _responses_response()
+    parent.llm_sign = {
+        "artifact_hash": "stored-parent-hash",
+        "artifact": {"chain": [{"block": {"seq": 7}}]},
+    }
+
+    assert llm_sign.responses_parent_signing_context(parent) == (
+        "stored-parent-hash",
+        8,
+    )
+
+
+def test_llm_sign_parent_context_ignores_missing_signature():
+    assert llm_sign.responses_parent_signing_context(_responses_response()) == (None, 0)
+
+
+@pytest.mark.asyncio
+async def test_llm_sign_responses_parent_context_is_resolved_before_generation(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("VLLM_LLM_SIGN_ENABLED", "1")
+
+    engine_client = MagicMock()
+    model_config = MagicMock()
+    model_config.hf_config.model_type = "test"
+    model_config.get_diff_sampling_param.return_value = {}
+    model_config.generation_config = "auto"
+    model_config.override_generation_config = {}
+    model_config.max_model_len = 100
+    engine_client.model_config = model_config
+    engine_client.input_processor = MagicMock()
+    engine_client.renderer = MagicMock()
+    engine_client.errored = False
+
+    models = MagicMock()
+    models.model_name.return_value = "test-model"
+    serving = OpenAIServingResponses(
+        engine_client=engine_client,
+        models=models,
+        openai_serving_render=MagicMock(),
+        request_logger=None,
+        chat_template=None,
+        chat_template_content_format="auto",
+    )
+    serving.enable_store = True
+
+    parent = _responses_response()
+    parent.id = "resp-parent"
+    parent.llm_sign = {
+        "artifact_hash": "stored-parent-hash",
+        "artifact": {"chain": [{"block": {"seq": 7}}]},
+    }
+    serving.response_store[parent.id] = parent
+
+    monkeypatch.setattr(serving, "_check_model", AsyncMock(return_value=None))
+    monkeypatch.setattr(serving, "_maybe_get_adapters", MagicMock(return_value=None))
+    monkeypatch.setattr(
+        serving,
+        "_make_request",
+        AsyncMock(return_value=([], [object()])),
+    )
+    monkeypatch.setattr(
+        serving, "_validate_generator_input", MagicMock(return_value=None)
+    )
+    monkeypatch.setattr(serving, "_extract_prompt_len", MagicMock(return_value=1))
+
+    async def empty_generator():
+        if False:
+            yield None
+
+    monkeypatch.setattr(
+        serving,
+        "_generate_with_builtin_tools",
+        MagicMock(return_value=empty_generator()),
+    )
+
+    captured: dict[str, object] = {}
+
+    async def fake_full_generator(*args, **kwargs):
+        captured.update(kwargs)
+        return _responses_response(previous_response_id="resp-parent")
+
+    monkeypatch.setattr(serving, "responses_full_generator", fake_full_generator)
+
+    request = ResponsesRequest(
+        model="test-model",
+        input="ping",
+        previous_response_id="resp-parent",
+        request_id="resp-parent",
+        store=True,
+    )
+
+    await serving.create_responses(request)
+
+    assert captured["parent_hash"] == "stored-parent-hash"
+    assert captured["start_seq"] == 8
+
+
+def test_llm_sign_filters_vllm_only_responses_response_fields(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("VLLM_LLM_SIGN_ENABLED", "1")
+    monkeypatch.setenv("VLLM_LLM_SIGN_CERTFILE", "cert.pem")
+    monkeypatch.setenv("VLLM_LLM_SIGN_KEYFILE", "key.pem")
+
+    captured: list[dict] = []
+    _install_fake_llm_sign(monkeypatch, captured)
+
+    response = _responses_response()
+    response.kv_transfer_params = {"foo": "bar"}
+    response.llm_sign = {"stale": "metadata"}
+
+    llm_sign.maybe_sign_responses_response(_responses_request(), response)
+
+    signed_response = captured[1]["response"]
+    assert signed_response["model"] == "test-model"
+    assert signed_response["status"] == "completed"
+    assert "output" in signed_response
+    assert "kv_transfer_params" not in signed_response
+    assert "llm_sign" not in signed_response
+
+
 def _install_fake_llm_sign(
     monkeypatch: pytest.MonkeyPatch,
     captured: list[dict],
@@ -112,7 +310,7 @@ def _install_fake_llm_sign(
     fake_pkg = ModuleType("llm_sign")
     fake_server = ModuleType("llm_sign.server")
 
-    _REQUEST_ALLOWED = {
+    _CHAT_REQUEST_ALLOWED = {
         "messages",
         "model",
         "temperature",
@@ -126,7 +324,7 @@ def _install_fake_llm_sign(
         "user",
         "metadata",
     }
-    _RESPONSE_ALLOWED = {
+    _CHAT_RESPONSE_ALLOWED = {
         "choices",
         "model",
         "response_format",
@@ -136,24 +334,82 @@ def _install_fake_llm_sign(
         "usage",
         "system_fingerprint",
     }
+    _RESPONSES_REQUEST_ALLOWED = {
+        "background",
+        "frequency_penalty",
+        "include",
+        "input",
+        "instructions",
+        "logit_bias",
+        "max_output_tokens",
+        "max_tool_calls",
+        "metadata",
+        "model",
+        "parallel_tool_calls",
+        "presence_penalty",
+        "previous_response_hash",
+        "previous_response_id",
+        "prompt",
+        "reasoning",
+        "service_tier",
+        "store",
+        "stream",
+        "temperature",
+        "text",
+        "tool_choice",
+        "tools",
+        "top_logprobs",
+        "top_p",
+        "truncation",
+        "user",
+    }
+    _RESPONSES_RESPONSE_ALLOWED = {
+        "background",
+        "created_at",
+        "frequency_penalty",
+        "id",
+        "incomplete_details",
+        "instructions",
+        "max_output_tokens",
+        "max_tool_calls",
+        "metadata",
+        "model",
+        "object",
+        "output",
+        "parallel_tool_calls",
+        "presence_penalty",
+        "previous_response_id",
+        "prompt",
+        "reasoning",
+        "service_tier",
+        "status",
+        "temperature",
+        "text",
+        "tool_choice",
+        "tools",
+        "top_logprobs",
+        "top_p",
+        "truncation",
+        "usage",
+        "user",
+    }
 
     def fake_project_openai_chat_request(payload):
-        return {k: v for k, v in payload.items() if k in _REQUEST_ALLOWED}
+        return {k: v for k, v in payload.items() if k in _CHAT_REQUEST_ALLOWED}
 
     def fake_project_openai_chat_response(payload):
-        return {k: v for k, v in payload.items() if k in _RESPONSE_ALLOWED}
+        return {k: v for k, v in payload.items() if k in _CHAT_RESPONSE_ALLOWED}
 
-    # Populate the fake ``llm_sign`` package. mypy types ``fake_pkg`` as the
-    # bare ``types.ModuleType`` stub (which of course knows nothing about
-    # ``llm_sign``'s public API) and treats ``setattr(mod, "literal", ...)``
-    # as an attribute-existence check against that stub, so we silence it
-    # explicitly rather than dodging the check.
-    setattr(  # type: ignore[attr-defined]
-        fake_pkg, "project_openai_chat_request", fake_project_openai_chat_request
-    )
-    setattr(  # type: ignore[attr-defined]
-        fake_pkg, "project_openai_chat_response", fake_project_openai_chat_response
-    )
+    def fake_project_openai_responses_request(payload):
+        return {k: v for k, v in payload.items() if k in _RESPONSES_REQUEST_ALLOWED}
+
+    def fake_project_openai_responses_response(payload):
+        return {k: v for k, v in payload.items() if k in _RESPONSES_RESPONSE_ALLOWED}
+
+    fake_pkg.project_openai_chat_request = fake_project_openai_chat_request  # type: ignore[attr-defined]
+    fake_pkg.project_openai_chat_response = fake_project_openai_chat_response  # type: ignore[attr-defined]
+    fake_pkg.project_openai_responses_request = fake_project_openai_responses_request  # type: ignore[attr-defined]
+    fake_pkg.project_openai_responses_response = fake_project_openai_responses_response  # type: ignore[attr-defined]
 
     class FakeCredential:
         @classmethod
@@ -169,10 +425,29 @@ def _install_fake_llm_sign(
 
     def fake_sign_openai_chat_turn(**kwargs):
         captured.append(kwargs)
-        return {"schema": "llm-sign.artifact.v1"}
+        return {
+            "schema": "llm-sign.artifact.v1",
+            "kind": "chat",
+            "chain": [{"block": {"seq": 0}}, {"block": {"seq": 1}}],
+        }
+
+    def fake_sign_openai_responses_turn(**kwargs):
+        captured.append(kwargs)
+        start_seq = kwargs.get("start_seq", 0)
+        return {
+            "schema": "llm-sign.artifact.v1",
+            "kind": "responses",
+            "chain": [
+                {"block": {"seq": start_seq}},
+                {"block": {"seq": start_seq + 1}},
+            ],
+        }
 
     def fake_attach(envelope, *, artifact, credential=None, certificate_chain_pem=None):
-        envelope["llm_sign"] = {"artifact": dict(artifact)}
+        envelope["llm_sign"] = {
+            "artifact": dict(artifact),
+            "artifact_hash": f"fake-{artifact.get('kind', 'artifact')}-hash",
+        }
         chain = certificate_chain_pem
         if chain is None and credential is not None:
             chain = credential.certificate_chain_pem()
@@ -181,13 +456,10 @@ def _install_fake_llm_sign(
         captured.append({"attached": envelope["llm_sign"]})
         return envelope
 
-    # Same rationale as above: mypy only sees ``fake_server`` as a generic
-    # ``types.ModuleType`` and flags these literal attribute writes.
-    setattr(fake_server, "TLSCertificateCredential", FakeCredential)  # type: ignore[attr-defined]
-    setattr(fake_server, "sign_openai_chat_turn", fake_sign_openai_chat_turn)  # type: ignore[attr-defined]
-    setattr(  # type: ignore[attr-defined]
-        fake_server, "attach_signed_artifact_to_openai_response", fake_attach
-    )
+    fake_server.TLSCertificateCredential = FakeCredential  # type: ignore[attr-defined]
+    fake_server.sign_openai_chat_turn = fake_sign_openai_chat_turn  # type: ignore[attr-defined]
+    fake_server.sign_openai_responses_turn = fake_sign_openai_responses_turn  # type: ignore[attr-defined]
+    fake_server.attach_signed_artifact_to_openai_response = fake_attach  # type: ignore[attr-defined]
 
     monkeypatch.setitem(sys.modules, "llm_sign", fake_pkg)
     monkeypatch.setitem(sys.modules, "llm_sign.server", fake_server)
@@ -203,10 +475,10 @@ def test_llm_sign_attaches_artifact_when_enabled(monkeypatch: pytest.MonkeyPatch
 
     response = llm_sign.maybe_sign_chat_completion(_request(), _response())
 
-    assert response.llm_sign == {
-        "artifact": {"schema": "llm-sign.artifact.v1"},
-        "certificate_chain": ["cert-chain"],
-    }
+    assert response.llm_sign["artifact"]["schema"] == "llm-sign.artifact.v1"
+    assert response.llm_sign["artifact"]["kind"] == "chat"
+    assert response.llm_sign["artifact_hash"] == "fake-chat-hash"
+    assert response.llm_sign["certificate_chain"] == ["cert-chain"]
     # The issuer (host name) is derived from the certificate by llm_sign;
     # vLLM forwards only the cert and key paths.
     assert calls[0] == {
@@ -218,12 +490,41 @@ def test_llm_sign_attaches_artifact_when_enabled(monkeypatch: pytest.MonkeyPatch
     assert calls[1]["signer"] == "signer"
     # The envelope was produced by llm_sign's official helper, not by
     # vLLM inlining the dict layout.
-    assert calls[-1] == {
-        "attached": {
-            "artifact": {"schema": "llm-sign.artifact.v1"},
-            "certificate_chain": ["cert-chain"],
-        }
+    assert calls[-1] == {"attached": response.llm_sign}
+
+
+def test_llm_sign_responses_attaches_artifact_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("VLLM_LLM_SIGN_ENABLED", "1")
+    monkeypatch.setenv("VLLM_LLM_SIGN_CERTFILE", "cert.pem")
+    monkeypatch.setenv("VLLM_LLM_SIGN_KEYFILE", "key.pem")
+
+    calls: list[dict] = []
+    _install_fake_llm_sign(monkeypatch, calls)
+
+    response = llm_sign.maybe_sign_responses_response(
+        _responses_request(previous_response_id="resp-parent"),
+        _responses_response(previous_response_id="resp-parent"),
+        parent_hash="parent-artifact-hash",
+        start_seq=4,
+    )
+
+    assert response.llm_sign["artifact"]["schema"] == "llm-sign.artifact.v1"
+    assert response.llm_sign["artifact"]["kind"] == "responses"
+    assert response.llm_sign["artifact"]["chain"][0]["block"]["seq"] == 4
+    assert response.llm_sign["artifact_hash"] == "fake-responses-hash"
+    assert response.llm_sign["certificate_chain"] == ["cert-chain"]
+    assert calls[0] == {
+        "ssl_certfile": "cert.pem",
+        "ssl_keyfile": "key.pem",
     }
+    assert calls[1]["request"]["previous_response_id"] == "resp-parent"
+    assert calls[1]["response"]["previous_response_id"] == "resp-parent"
+    assert calls[1]["signer"] == "signer"
+    assert calls[1]["parent_hash"] == "parent-artifact-hash"
+    assert calls[1]["start_seq"] == 4
+    assert calls[-1] == {"attached": response.llm_sign}
 
 
 def test_llm_sign_requires_cert_and_key(monkeypatch: pytest.MonkeyPatch):
@@ -269,4 +570,31 @@ def _response() -> ChatCompletionResponse:
             )
         ],
         usage=UsageInfo(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+    )
+
+
+def _responses_request(previous_response_id: str | None = None) -> ResponsesRequest:
+    return ResponsesRequest(
+        model="test-model",
+        input="ping",
+        previous_response_id=previous_response_id,
+        store=False,
+    )
+
+
+def _responses_response(previous_response_id: str | None = None) -> ResponsesResponse:
+    return ResponsesResponse(
+        model="test-model",
+        output=[],
+        parallel_tool_calls=True,
+        temperature=0.0,
+        tool_choice="auto",
+        tools=[],
+        top_p=1.0,
+        background=False,
+        max_output_tokens=16,
+        previous_response_id=previous_response_id,
+        service_tier="auto",
+        status="completed",
+        truncation="disabled",
     )
